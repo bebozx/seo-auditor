@@ -5,7 +5,7 @@ on:
   issues:
     types: [opened]
 
-# مهم: نسمح للـ workflow يكتب تعليق على الـ Issues ويرفع Artifacts
+# نسمح للـ workflow يرفع artifacts ويكتب تعليق على الـ Issues
 permissions:
   contents: write
   issues: write
@@ -26,13 +26,13 @@ jobs:
       - name: Install Chrome
         uses: browser-actions/setup-chrome@v1
 
-      # هنكتفي بالحزم دي. هنستخدم fetch المدمج في Node 20 (بدون node-fetch).
+      # هنستخدم فقط الحزم الضرورية: Lighthouse + Cheerio
       - name: Install dependencies
         run: |
           npm init -y
-          npm install @lhci/cli@0.13.x cheerio linkinator
+          npm install @lhci/cli@0.13.x cheerio
 
-      # نستخرج الرابط من عنوان أو متن الـ Issue ونخزّنه كـ URL في GITHUB_ENV
+      # نستخرج الرابط من عنوان/متن الـ Issue ونخزّنه كـ URL
       - name: Extract URL from issue (title/body)
         id: extract
         run: |
@@ -80,9 +80,9 @@ jobs:
 
           const data = {
             url,
-            title: $('title').text() || '',
+            title: $('title').text()?.trim() || '',
             metaDesc: $('meta[name="description"]').attr('content') || '',
-            h1: $('h1').first().text() || '',
+            h1: $('h1').first().text()?.trim() || '',
             canonical: $('link[rel="canonical"]').attr('href') || '',
             robots: $('meta[name="robots"]').attr('content') || ''
           };
@@ -90,28 +90,68 @@ jobs:
           writeFileSync(`reports/${process.env.GITHUB_RUN_ID}/seo.json`, JSON.stringify(data, null, 2));
           EOF
 
-      - name: Check broken links (ESM)
+      - name: Check broken links (custom ESM)
         env:
           URL: ${{ env.URL }}
         run: |
           node --input-type=module << 'EOF'
-          import linkinator from 'linkinator';
+          import { load } from 'cheerio';
           import { writeFileSync } from 'fs';
 
-          const { LinkChecker } = linkinator;
-          const checker = new LinkChecker();
-          const results = await checker.check({
-            path: process.env.URL,
-            recurse: false,
-            timeout: 15000
+          const baseUrl = process.env.URL;
+
+          // جلب HTML وجمع الروابط
+          const page = await fetch(baseUrl, { headers: { 'User-Agent': 'SEO-Auditor/1.0' }});
+          const html = await page.text();
+          const $ = load(html);
+
+          // تحويل أي رابط نسبي إلى مطلق
+          const toAbs = (base, href) => {
+            try { return new URL(href, base).href; } catch { return null; }
+          };
+
+          const hrefs = new Set();
+          $('a[href]').each((_, el) => {
+            const abs = toAbs(baseUrl, $(el).attr('href'));
+            if (abs) hrefs.add(abs);
           });
 
-          const broken = results.links
-            .filter(l => l.state === 'BROKEN')
-            .map(l => ({ url: l.url, status: l.status }));
+          // نحط حد أقصى للروابط عشان زمن الجوب (مثلاً 150)
+          const MAX = 150;
+          const urls = Array.from(hrefs).slice(0, MAX);
+
+          // وظيفة طلب مع مهلة
+          const check = async (u) => {
+            const controller = new AbortController();
+            const id = setTimeout(() => controller.abort(), 12000); // 12s timeout
+            try {
+              // جرّب HEAD أولاً؛ لو فشل استخدم GET خفيف
+              let r = await fetch(u, { method: 'HEAD', redirect: 'follow', signal: controller.signal });
+              if (!r.ok || r.status >= 400) {
+                r = await fetch(u, { method: 'GET', redirect: 'follow', signal: controller.signal });
+              }
+              clearTimeout(id);
+              return { url: u, status: r.status, ok: r.ok };
+            } catch (e) {
+              clearTimeout(id);
+              return { url: u, status: 0, ok: false, error: String(e?.name || e) };
+            }
+          };
+
+          const results = [];
+          // نعمل دفعات صغيرة لتقليل الضغط
+          const BATCH = 15;
+          for (let i=0; i<urls.length; i+=BATCH) {
+            const chunk = urls.slice(i, i+BATCH);
+            const out = await Promise.all(chunk.map(check));
+            results.push(...out);
+          }
+
+          const broken = results.filter(x => !x.ok || x.status >= 400)
+                                .map(x => ({ url: x.url, status: x.status || 'ERR', error: x.error || '' }));
 
           writeFileSync(`reports/${process.env.GITHUB_RUN_ID}/links.json`, JSON.stringify({
-            scanned: results.links.length,
+            scanned: urls.length,
             brokenCount: broken.length,
             broken
           }, null, 2));
@@ -123,7 +163,6 @@ jobs:
           name: report-${{ github.run_id }}
           path: reports/${{ github.run_id }}
 
-      # نعلّق باستخدام REST API مباشرة علشان نضمن الصلاحيات تشتغل
       - name: Comment back with link (REST)
         env:
           RUN_ID: ${{ github.run_id }}
@@ -133,9 +172,7 @@ jobs:
         run: |
           API="https://api.github.com/repos/$REPO/issues/$ISSUE_NUMBER/comments"
           BODY=$(cat <<EOF
-          {
-            "body": "✅ Report ready! Download artifacts:\nhttps://github.com/$REPO/actions/runs/$RUN_ID"
-          }
+          { "body": "✅ Report ready! Download artifacts:\nhttps://github.com/$REPO/actions/runs/$RUN_ID" }
           EOF
           )
           curl -s -f -X POST "$API" \
