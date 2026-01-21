@@ -21,19 +21,18 @@ jobs:
       - name: Install Chrome
         uses: browser-actions/setup-chrome@v1
 
+      # مفيش node-fetch هنا - هنستخدم fetch المدمج
       - name: Install dependencies
         run: |
           npm init -y
-          npm install @lhci/cli@0.13.x cheerio linkinator node-fetch@3
+          npm install @lhci/cli@0.13.x cheerio linkinator
 
       - name: Extract URL from issue (title/body)
         id: extract
         run: |
           TITLE=$(jq -r '.issue.title' "$GITHUB_EVENT_PATH")
           BODY=$(jq -r '.issue.body' "$GITHUB_EVENT_PATH")
-          # جرّب العنوان أولاً
           URL=$(echo "$TITLE" | grep -oE 'https?://[^ ]+' || true)
-          # ولو فشل، جرّب المتن
           if [ -z "$URL" ]; then
             URL=$(echo "$BODY" | grep -oE 'https?://[^ ]+' | head -n1 || true)
           fi
@@ -58,45 +57,53 @@ jobs:
             --outputDir="reports/$GITHUB_RUN_ID/lh" \
             --report=html,json \
             --settings.chromePath="$(which chrome)" \
-            --settings.chromeFlags="--headless=new"
+            --settings.chromeFlags="--headless=new --no-sandbox --disable-gpu"
 
-      - name: Scrape SEO elements
+      - name: Scrape SEO elements (ESM)
+        env:
+          URL: ${{ env.URL }}
         run: |
-          node << 'EOF'
-          import fetch from 'node-fetch';
-          import fs from 'fs';
-          import cheerio from 'cheerio';
+          node --input-type=module << 'EOF'
+          import { writeFileSync } from 'fs';
+          import { load } from 'cheerio';
 
           const url = process.env.URL;
-          const res = await fetch(url, {headers:{'User-Agent':'SEO-Auditor/1.0'}});
+          const res = await fetch(url, { headers: { 'User-Agent': 'SEO-Auditor/1.0' }});
           const html = await res.text();
-          const $ = cheerio.load(html);
+          const $ = load(html);
 
           const data = {
             url,
             title: $('title').text() || '',
             metaDesc: $('meta[name="description"]').attr('content') || '',
-            h1: $('h1').first().text() || ''
+            h1: $('h1').first().text() || '',
+            canonical: $('link[rel="canonical"]').attr('href') || '',
+            robots: $('meta[name="robots"]').attr('content') || ''
           };
 
-          fs.writeFileSync(`reports/${process.env.GITHUB_RUN_ID}/seo.json`, JSON.stringify(data, null, 2));
+          writeFileSync(`reports/${process.env.GITHUB_RUN_ID}/seo.json`, JSON.stringify(data, null, 2));
           EOF
 
-      - name: Check broken links
+      - name: Check broken links (ESM)
+        env:
+          URL: ${{ env.URL }}
         run: |
-          node << 'EOF'
+          node --input-type=module << 'EOF'
           import { LinkChecker } from 'linkinator';
-          import fs from 'fs';
+          import { writeFileSync } from 'fs';
 
           const checker = new LinkChecker();
-          const res = await checker.check({
+          const results = await checker.check({
             path: process.env.URL,
             recurse: false,
             timeout: 15000
           });
-          const broken = res.links.filter(l => l.state === 'BROKEN').map(l=>({url:l.url,status:l.status}));
-          fs.writeFileSync(`reports/${process.env.GITHUB_RUN_ID}/links.json`, JSON.stringify({
-            scanned: res.links.length,
+          const broken = results.links
+            .filter(l => l.state === 'BROKEN')
+            .map(l => ({ url: l.url, status: l.status }));
+
+          writeFileSync(`reports/${process.env.GITHUB_RUN_ID}/links.json`, JSON.stringify({
+            scanned: results.links.length,
             brokenCount: broken.length,
             broken
           }, null, 2));
