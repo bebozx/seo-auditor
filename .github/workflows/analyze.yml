@@ -1,100 +1,96 @@
 
-name: Analyze URL Requests
+name: Generate Report
 
 on:
   issues:
-    types: [opened, labeled]
-
-permissions:
-  contents: write
-  issues: write
+    types: [opened]
 
 jobs:
   analyze:
-    if: >
-      github.event_name == 'issues' &&
-      (github.event.action == 'opened' ||
-       contains(github.event.issue.labels.*.name, 'scan-request'))
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: 20
 
-      - name: Install Chrome (for Lighthouse)
+      - name: Install Chrome
         uses: browser-actions/setup-chrome@v1
 
-      - name: Install deps
-        run: npm ci
-
-      - name: Parse URL from issue
-        id: parse
+      - name: Install dependencies
         run: |
-          node -e "const fs=require('fs');const e=JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH,'utf8'));let url='';let id=e.issue?.number;if(e.issue?.body){const m=e.issue.body.match(/URL:\s*(https?:\/\/\S+)/i);if(m) url=m[1];}if(!url){console.log('::error::No URL in issue body. Expected \"URL: https://...\"');process.exit(1);}console.log(`::set-output name=id::${id}`);console.log(`::set-output name=url::${url}`);"
+          npm init -y
+          npm install @lhci/cli@0.13.x cheerio linkinator node-fetch@3
 
-      - name: Prepare output folder
-        id: vars
+      - name: Extract URL from issue
+        id: extract
         run: |
-          URL="${{ steps.parse.outputs.url }}"
-          DOMAIN=$(node -e "console.log(new URL(process.env.URL).hostname)" URL="$URL")
-          JOBID="job-$(date +%Y%m%d-%H%M%S)-${{ steps.parse.outputs.id }}"
-          OUTDIR="out/$DOMAIN/$JOBID"
-          echo "URL=$URL" >> $GITHUB_ENV
-          echo "DOMAIN=$DOMAIN" >> $GITHUB_ENV
-          echo "JOBID=$JOBID" >> $GITHUB_ENV
-          echo "OUTDIR=$OUTDIR" >> $GITHUB_ENV
-          mkdir -p "$OUTDIR/lighthouse"
+          url=$(jq -r '.issue.body' $GITHUB_EVENT_PATH | grep -oP 'https?://\S+')
+          echo "url=$url" >> $GITHUB_ENV
+          echo "URL detected: $url"
 
-      - name: Run Lighthouse (1 pass)
+      - name: Create output folder
         run: |
-          npx @lhci/cli@0.13.x collect \
+          mkdir -p reports/$GITHUB_RUN_ID
+
+      - name: Run Lighthouse
+        run: |
+          npx @lhci/cli collect \
             --url "$URL" \
             --numberOfRuns=1 \
-            --settings.chromePath=$(which chrome) \
-            --settings.formFactor=mobile \
-            --settings.screenEmulation.mobile=true \
-            --outputDir="$OUTDIR/lighthouse" \
-            --report=html,json
+            --outputDir="reports/$GITHUB_RUN_ID/lh" \
+            --report=html,json \
+            --settings.chromePath=$(which chrome)
 
-      - name: Run SEO analyzer
-        run: node scripts/analyze-seo.js "$URL" "$OUTDIR/seo.json"
-
-      - name: Check links
-        run: node scripts/check-links.js "$URL" "$OUTDIR/links.json"
-
-      - name: Merge report + index
-        run: node scripts/merge-report.js "$OUTDIR" "$URL" "$DOMAIN" "$JOBID"
-
-      # نشر التقارير في ريبو منفصل GitHub Pages
-      - name: Push reports to seo-auditor-reports
-        env:
-          GH_TOKEN: ${{ secrets.REPORTS_PUSH_TOKEN }}
-          REPORTS_OWNER: ${{ secrets.REPORTS_OWNER }}
-          REPORTS_REPO: ${{ secrets.REPORTS_REPO }}
+      - name: Scrape SEO elements
         run: |
-          cd out
-          git init
-          git config user.name "seo-auditor-bot"
-          git config user.email "bot@users.noreply.github.com"
-          git add .
-          git commit -m "Report: $JOBID ($DOMAIN)"
-          git branch -M main
-          git remote add origin "https://${REPORTS_OWNER}:${GH_TOKEN}@github.com/${REPORTS_OWNER}/${REPORTS_REPO}.git"
-          git pull origin main --allow-unrelated-histories || true
-          git push origin main
+          node << 'EOF'
+          import fetch from 'node-fetch';
+          import fs from 'fs';
+          import cheerio from 'cheerio';
 
-      - name: Comment with report link & close issue
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPORTS_BASE: ${{ secrets.REPORTS_PAGES_BASE }}
+          const url = process.env.URL;
+          const res = await fetch(url);
+          const html = await res.text();
+          const $ = cheerio.load(html);
+
+          const data = {
+            title: $('title').text(),
+            metaDesc: $('meta[name="description"]').attr('content') || '',
+            h1: $('h1').first().text(),
+          };
+
+          fs.writeFileSync(`reports/${process.env.GITHUB_RUN_ID}/seo.json`, JSON.stringify(data, null, 2));
+          EOF
+
+      - name: Check broken links
         run: |
-          LINK="${REPORTS_BASE}/$DOMAIN/$JOBID/index.html"
-          echo "Report URL: $LINK"
-          gh issue comment ${{ steps.parse.outputs.id }} --body "✅ Report ready: $LINK"
-          gh issue close ${{ steps.parse.outputs.id }} -r completed
-``
+          node << 'EOF'
+          import { LinkChecker } from 'linkinator';
+          import fs from 'fs';
+
+          const checker = new LinkChecker();
+          const results = await checker.check({ path: process.env.URL, recurse: false });
+          const broken = results.links.filter(l => l.state === 'BROKEN');
+          fs.writeFileSync(
+            `reports/${process.env.GITHUB_RUN_ID}/links.json`,
+            JSON.stringify(broken, null, 2)
+          );
+          EOF
+
+      - name: Upload report as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-${{ github.run_id }}
+          path: reports/${{ github.run_id }}
+
+      - name: Comment back with link
+        env:
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          gh issue comment ${{ github.event.issue.number }} \
+            --body "Report ready! Download artifacts here: https://github.com/${{ github.repository }}/actions/runs/${RUN_ID}"
