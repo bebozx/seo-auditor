@@ -26,25 +26,39 @@ jobs:
           npm init -y
           npm install @lhci/cli@0.13.x cheerio linkinator node-fetch@3
 
-      - name: Extract URL from issue
+      - name: Extract URL from issue (title/body)
         id: extract
         run: |
-          url=$(jq -r '.issue.body' $GITHUB_EVENT_PATH | grep -oP 'https?://\S+')
-          echo "url=$url" >> $GITHUB_ENV
-          echo "URL detected: $url"
+          TITLE=$(jq -r '.issue.title' "$GITHUB_EVENT_PATH")
+          BODY=$(jq -r '.issue.body' "$GITHUB_EVENT_PATH")
+          # جرّب العنوان أولاً
+          URL=$(echo "$TITLE" | grep -oE 'https?://[^ ]+' || true)
+          # ولو فشل، جرّب المتن
+          if [ -z "$URL" ]; then
+            URL=$(echo "$BODY" | grep -oE 'https?://[^ ]+' | head -n1 || true)
+          fi
+          if [ -z "$URL" ]; then
+            echo "❌ لم يتم العثور على URL داخل الـ Issue."
+            exit 1
+          fi
+          echo "URL=$URL" >> $GITHUB_ENV
+          echo "✅ Using URL: $URL"
 
       - name: Create output folder
-        run: |
-          mkdir -p reports/$GITHUB_RUN_ID
+        run: mkdir -p reports/$GITHUB_RUN_ID
 
       - name: Run Lighthouse
+        env:
+          URL: ${{ env.URL }}
         run: |
+          echo "Running Lighthouse for $URL"
           npx @lhci/cli collect \
             --url "$URL" \
             --numberOfRuns=1 \
             --outputDir="reports/$GITHUB_RUN_ID/lh" \
             --report=html,json \
-            --settings.chromePath=$(which chrome)
+            --settings.chromePath="$(which chrome)" \
+            --settings.chromeFlags="--headless=new"
 
       - name: Scrape SEO elements
         run: |
@@ -54,14 +68,15 @@ jobs:
           import cheerio from 'cheerio';
 
           const url = process.env.URL;
-          const res = await fetch(url);
+          const res = await fetch(url, {headers:{'User-Agent':'SEO-Auditor/1.0'}});
           const html = await res.text();
           const $ = cheerio.load(html);
 
           const data = {
-            title: $('title').text(),
+            url,
+            title: $('title').text() || '',
             metaDesc: $('meta[name="description"]').attr('content') || '',
-            h1: $('h1').first().text(),
+            h1: $('h1').first().text() || ''
           };
 
           fs.writeFileSync(`reports/${process.env.GITHUB_RUN_ID}/seo.json`, JSON.stringify(data, null, 2));
@@ -74,12 +89,17 @@ jobs:
           import fs from 'fs';
 
           const checker = new LinkChecker();
-          const results = await checker.check({ path: process.env.URL, recurse: false });
-          const broken = results.links.filter(l => l.state === 'BROKEN');
-          fs.writeFileSync(
-            `reports/${process.env.GITHUB_RUN_ID}/links.json`,
-            JSON.stringify(broken, null, 2)
-          );
+          const res = await checker.check({
+            path: process.env.URL,
+            recurse: false,
+            timeout: 15000
+          });
+          const broken = res.links.filter(l => l.state === 'BROKEN').map(l=>({url:l.url,status:l.status}));
+          fs.writeFileSync(`reports/${process.env.GITHUB_RUN_ID}/links.json`, JSON.stringify({
+            scanned: res.links.length,
+            brokenCount: broken.length,
+            broken
+          }, null, 2));
           EOF
 
       - name: Upload report as artifact
@@ -91,6 +111,7 @@ jobs:
       - name: Comment back with link
         env:
           RUN_ID: ${{ github.run_id }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh issue comment ${{ github.event.issue.number }} \
-            --body "Report ready! Download artifacts here: https://github.com/${{ github.repository }}/actions/runs/${RUN_ID}"
+            --body "✅ Report ready! Download artifacts:\nhttps://github.com/${{ github.repository }}/actions/runs/${RUN_ID}"
