@@ -5,6 +5,11 @@ on:
   issues:
     types: [opened]
 
+# مهم: نسمح للـ workflow يكتب تعليق على الـ Issues ويرفع Artifacts
+permissions:
+  contents: write
+  issues: write
+
 jobs:
   analyze:
     runs-on: ubuntu-latest
@@ -21,12 +26,13 @@ jobs:
       - name: Install Chrome
         uses: browser-actions/setup-chrome@v1
 
-      # مفيش node-fetch هنا - هنستخدم fetch المدمج
+      # هنكتفي بالحزم دي. هنستخدم fetch المدمج في Node 20 (بدون node-fetch).
       - name: Install dependencies
         run: |
           npm init -y
           npm install @lhci/cli@0.13.x cheerio linkinator
 
+      # نستخرج الرابط من عنوان أو متن الـ Issue ونخزّنه كـ URL في GITHUB_ENV
       - name: Extract URL from issue (title/body)
         id: extract
         run: |
@@ -89,15 +95,17 @@ jobs:
           URL: ${{ env.URL }}
         run: |
           node --input-type=module << 'EOF'
-          import { LinkChecker } from 'linkinator';
+          import linkinator from 'linkinator';
           import { writeFileSync } from 'fs';
 
+          const { LinkChecker } = linkinator;
           const checker = new LinkChecker();
           const results = await checker.check({
             path: process.env.URL,
             recurse: false,
             timeout: 15000
           });
+
           const broken = results.links
             .filter(l => l.state === 'BROKEN')
             .map(l => ({ url: l.url, status: l.status }));
@@ -115,10 +123,22 @@ jobs:
           name: report-${{ github.run_id }}
           path: reports/${{ github.run_id }}
 
-      - name: Comment back with link
+      # نعلّق باستخدام REST API مباشرة علشان نضمن الصلاحيات تشتغل
+      - name: Comment back with link (REST)
         env:
           RUN_ID: ${{ github.run_id }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: |
-          gh issue comment ${{ github.event.issue.number }} \
-            --body "✅ Report ready! Download artifacts:\nhttps://github.com/${{ github.repository }}/actions/runs/${RUN_ID}"
+          API="https://api.github.com/repos/$REPO/issues/$ISSUE_NUMBER/comments"
+          BODY=$(cat <<EOF
+          {
+            "body": "✅ Report ready! Download artifacts:\nhttps://github.com/$REPO/actions/runs/$RUN_ID"
+          }
+          EOF
+          )
+          curl -s -f -X POST "$API" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -d "$BODY"
