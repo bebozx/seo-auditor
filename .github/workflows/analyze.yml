@@ -1,0 +1,100 @@
+
+name: Analyze URL Requests
+
+on:
+  issues:
+    types: [opened, labeled]
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  analyze:
+    if: >
+      github.event_name == 'issues' &&
+      (github.event.action == 'opened' ||
+       contains(github.event.issue.labels.*.name, 'scan-request'))
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Chrome (for Lighthouse)
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Parse URL from issue
+        id: parse
+        run: |
+          node -e "const fs=require('fs');const e=JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH,'utf8'));let url='';let id=e.issue?.number;if(e.issue?.body){const m=e.issue.body.match(/URL:\s*(https?:\/\/\S+)/i);if(m) url=m[1];}if(!url){console.log('::error::No URL in issue body. Expected \"URL: https://...\"');process.exit(1);}console.log(`::set-output name=id::${id}`);console.log(`::set-output name=url::${url}`);"
+
+      - name: Prepare output folder
+        id: vars
+        run: |
+          URL="${{ steps.parse.outputs.url }}"
+          DOMAIN=$(node -e "console.log(new URL(process.env.URL).hostname)" URL="$URL")
+          JOBID="job-$(date +%Y%m%d-%H%M%S)-${{ steps.parse.outputs.id }}"
+          OUTDIR="out/$DOMAIN/$JOBID"
+          echo "URL=$URL" >> $GITHUB_ENV
+          echo "DOMAIN=$DOMAIN" >> $GITHUB_ENV
+          echo "JOBID=$JOBID" >> $GITHUB_ENV
+          echo "OUTDIR=$OUTDIR" >> $GITHUB_ENV
+          mkdir -p "$OUTDIR/lighthouse"
+
+      - name: Run Lighthouse (1 pass)
+        run: |
+          npx @lhci/cli@0.13.x collect \
+            --url "$URL" \
+            --numberOfRuns=1 \
+            --settings.chromePath=$(which chrome) \
+            --settings.formFactor=mobile \
+            --settings.screenEmulation.mobile=true \
+            --outputDir="$OUTDIR/lighthouse" \
+            --report=html,json
+
+      - name: Run SEO analyzer
+        run: node scripts/analyze-seo.js "$URL" "$OUTDIR/seo.json"
+
+      - name: Check links
+        run: node scripts/check-links.js "$URL" "$OUTDIR/links.json"
+
+      - name: Merge report + index
+        run: node scripts/merge-report.js "$OUTDIR" "$URL" "$DOMAIN" "$JOBID"
+
+      # نشر التقارير في ريبو منفصل GitHub Pages
+      - name: Push reports to seo-auditor-reports
+        env:
+          GH_TOKEN: ${{ secrets.REPORTS_PUSH_TOKEN }}
+          REPORTS_OWNER: ${{ secrets.REPORTS_OWNER }}
+          REPORTS_REPO: ${{ secrets.REPORTS_REPO }}
+        run: |
+          cd out
+          git init
+          git config user.name "seo-auditor-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add .
+          git commit -m "Report: $JOBID ($DOMAIN)"
+          git branch -M main
+          git remote add origin "https://${REPORTS_OWNER}:${GH_TOKEN}@github.com/${REPORTS_OWNER}/${REPORTS_REPO}.git"
+          git pull origin main --allow-unrelated-histories || true
+          git push origin main
+
+      - name: Comment with report link & close issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPORTS_BASE: ${{ secrets.REPORTS_PAGES_BASE }}
+        run: |
+          LINK="${REPORTS_BASE}/$DOMAIN/$JOBID/index.html"
+          echo "Report URL: $LINK"
+          gh issue comment ${{ steps.parse.outputs.id }} --body "✅ Report ready: $LINK"
+          gh issue close ${{ steps.parse.outputs.id }} -r completed
+``
